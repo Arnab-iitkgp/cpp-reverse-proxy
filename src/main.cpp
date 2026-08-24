@@ -5,7 +5,7 @@ int main(){
     TCPServer server("127.0.0.1",8080);
 
     if(server.start()){
-        server.listenForCLient();
+       while(true) server.listenForCLient();
     }else{
         std::cerr<<"Failed to start the server. \n";
     }

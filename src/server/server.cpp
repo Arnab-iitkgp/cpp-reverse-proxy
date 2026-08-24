@@ -1,3 +1,4 @@
+#include <thread>
 #include "server.h"
 #include<iostream>
 #include<winsock2.h>
@@ -53,6 +54,29 @@ bool TCPServer::start(){
     std::cout<<"Server is listening on PORT"<<port<<"\n";
     return true;
 }
+void handleClient(SOCKET clientSocket){
+    // to recv from caller
+    char buffer[1024]= {0}; // to store incoming msg
+    int bytesReceived = recv(clientSocket,buffer, sizeof(buffer),0);
+
+    if(bytesReceived>0){
+        std::cout<<"--raw data recved--\n";
+        std::cout<<buffer<<'\n';
+        std::cout<<"---------------\n";
+
+        // parsing
+        HTTPRequest req;
+        req.parse(buffer);
+    }
+    const char* response = "HTTP/1.1 200 OK\r\n" "Content-Type: text/html\r\n" "Content-Length: 46\r\n"   "Connection: close\r\n" "\r\n" "<html><body><h1>Hello World!</h1></body></html>";
+    send(clientSocket,response,strlen(response),0);
+    shutdown(clientSocket, SD_SEND);
+    closesocket(clientSocket);
+
+    std:: cout<<"Client handled and disconnected.\n";
+
+}
+
 
 void TCPServer::listenForCLient(){
    //accepting client
@@ -68,26 +92,9 @@ void TCPServer::listenForCLient(){
 
     std::cout<<"A client is connected\n";
 
-    // listen to the caller (recv);
+    // spawn a new thread, hand the client socket to it, and immediately 
+    // go back to accept() -- the thread handles everything else
 
-    char buffer[1024] ={0}; // to store the incoming msg in chars;
-    int bytesReceived  = recv(clientSocket, buffer,sizeof(buffer),0);
-
-    if(bytesReceived>0){
-        std::cout<<"--raw data recved--\n";
-        std::cout<<buffer<<'\n';
-        std::cout<<"---------------\n";
-
-        // parsing
-        HTTPRequest req;
-        req.parse(buffer);
-    }
-
-    // talk back -- send;
-    // we send a tiny raw http response so the browser can understand it;
-
-    const char* response = "HTTP/1.1 200 OK\r\n" "Content-Type: text/html\r\n" "Content-Length: 46\r\n"   "Connection: close\r\n" "\r\n" "<html><body><h1>Hello World!</h1></body></html>";
-    send(clientSocket,response,strlen(response),0);
-     shutdown(clientSocket, SD_SEND);
-    closesocket(clientSocket);
+    std::thread t(handleClient,clientSocket);
+    t.detach();
 }
