@@ -2,7 +2,7 @@
 #include<iostream>
 #include<winsock2.h>
 #include<ws2tcpip.h>
-
+#include "../http/request.h"
 
 TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port){
      WSADATA wsaData;
@@ -74,16 +74,20 @@ void TCPServer::listenForCLient(){
     int bytesReceived  = recv(clientSocket, buffer,sizeof(buffer),0);
 
     if(bytesReceived>0){
-        std::cout<<"--data recved--\n";
+        std::cout<<"--raw data recved--\n";
         std::cout<<buffer<<'\n';
         std::cout<<"---------------\n";
+
+        // parsing
+        HTTPRequest req;
+        req.parse(buffer);
     }
 
     // talk back -- send;
     // we send a tiny raw http response so the browser can understand it;
 
-    const char* response = "HTTP/1.1 200 OK\r\n Content-Length: 13\r\n\r\nHello, World\n";
+    const char* response = "HTTP/1.1 200 OK\r\n" "Content-Type: text/html\r\n" "Content-Length: 46\r\n"   "Connection: close\r\n" "\r\n" "<html><body><h1>Hello World!</h1></body></html>";
     send(clientSocket,response,strlen(response),0);
-
+     shutdown(clientSocket, SD_SEND);
     closesocket(clientSocket);
 }
