@@ -1,0 +1,11 @@
+build/
+.exe
+main.exe
+bombardier.exe
+proxy.exe
+fast_backend.exe
+.vscode/
+.vs/
+*.o
+*.obj
+*.pdb
