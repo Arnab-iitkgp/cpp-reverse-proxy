@@ -5,6 +5,8 @@
 #include<ws2tcpip.h>
 #include "../http/request.h"
 #include<string>
+#include<vector>
+#include<mutex>
 
 TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port),pool(8){
      WSADATA wsaData;
@@ -55,6 +57,12 @@ bool TCPServer::start(){
     std::cout<<"Server is listening on PORT"<<port<<"\n";
     return true;
 }
+
+std::vector<int>backends = {9001,9002,9003}; // list of backend server
+int current_backend_index=0;
+std::mutex rr_mutex; // protects the current_backend_index
+
+
 void handleClient(SOCKET clientSocket){
     //1. to recv from caller / recv the browser request
     char buffer[4096]= {0}; // to store incoming msg
@@ -74,28 +82,44 @@ void handleClient(SOCKET clientSocket){
         req.parse(buffer);
         std::cout<<" "<<req.method<<" "<<req.path<<"\n";
 
-    // 2.connect to the backend (so its acting as client)
+    // 2. connect to the backend (load balancer and Fault tolerant)
+    SOCKET backendSocket = INVALID_SOCKET;
+    int retries = backends.size() ; // try each backend exactly once
+    bool connected = false;
+    int targetPort = 0;
 
-    SOCKET backendSocket = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-    if(backendSocket==INVALID_SOCKET){
-        std::cerr<<"[proxy] failed to create backend socket\n";
+    while(retries>0 && !connected){
+        // safely get the next prot using Round-Robin mutex
+        {
+            std::unique_lock<std::mutex>lock(rr_mutex);
+            targetPort = backends[current_backend_index];
+            current_backend_index = (current_backend_index+1)%backends.size();
+            //mutex release here
+        }
+        backendSocket = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+
+        sockaddr_in backendAddr;
+        backendAddr.sin_family = AF_INET;
+        backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        backendAddr.sin_port = htons(targetPort);
+
+        std::cout<<"[Proxy] Attempting to connect backend : "<<targetPort<<"...\n";
+
+        if(connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr))!=SOCKET_ERROR){
+            connected=true;
+            std::cout<<"[Proxy] suuccessfully connected to backend "<<targetPort<<"\n";
+        }else{
+            std::cerr<<"[Proxy] Backend: "<<targetPort<<" is down! Trying the next";
+            closesocket(backendSocket);
+            retries--;
+        }
+    }
+
+    if(!connected){
+        std::cerr<<"[Proxy] All backends are DOWN! Dropping client.\n";
         closesocket(clientSocket);
         return;
     }
-
-    sockaddr_in backendAddr;
-    backendAddr.sin_family = AF_INET;
-    backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    backendAddr.sin_port = htons(9001); // Python server
-
-     if (connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr)) == SOCKET_ERROR) {
-        std::cerr << "[Proxy] Failed to connect to backend on port 9001\n";
-        closesocket(backendSocket);
-        closesocket(clientSocket);
-        return;
-    }
-
-    std::cout<<"[Proxy] : connected to backend : 9001\n";
 
     //3. forward the browser's req to the backend
     //AND  Modify the request: tell backend to close connection after responding
