@@ -5,7 +5,7 @@
 #include<ws2tcpip.h>
 #include "../http/request.h"
 
-TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port){
+TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port),pool(8){
      WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) { 
         std::cerr << "WSAStartup failed." << std::endl;
@@ -92,9 +92,10 @@ void TCPServer::listenForCLient(){
 
     std::cout<<"A client is connected\n";
 
-    // spawn a new thread, hand the client socket to it, and immediately 
-    // go back to accept() -- the thread handles everything else
+    // push the task into ouor thread pool queue
+    // the [clientSocket] means "pass this var into the lambda"
 
-    std::thread t(handleClient,clientSocket);
-    t.detach();
+    pool.enqueue([clientSocket]{
+        handleClient(clientSocket);
+    });
 }
