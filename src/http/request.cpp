@@ -10,6 +10,6 @@ void HTTPRequest::parse(std::string raw_request){
     stream>>path; // "/"
     stream>>version; //"HTTP/1.1"
     
-    std::cout<<"Method: "<<method<<"\n";
-    std::cout<<"Path: "<<path<<"\n";
+    // std::cout<<"Method: "<<method<<"\n";
+    // std::cout<<"Path: "<<path<<"\n";
 }

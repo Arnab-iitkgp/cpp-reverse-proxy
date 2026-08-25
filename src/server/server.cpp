@@ -8,8 +8,9 @@
 #include<vector>
 #include<mutex>
 #include<chrono>
+#include<atomic>
 
-TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port),pool(8){
+TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port),pool(128){
      WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) { 
         std::cerr << "WSAStartup failed." << std::endl;
@@ -63,7 +64,7 @@ bool TCPServer::start(){
 std::vector<int>all_backends = {9001,9002,9003}; // list of backend server
 std::vector<int> healthy_backends = {9001,9002,9003}; // workers only use this
 
-int current_backend_index=0;
+int current_backend_index = 0;
 std::mutex rr_mutex; // protects the current_backend_index
 
 //runs in background and pings server every 5 sec
@@ -94,37 +95,17 @@ void backgroundHealthMonitor(){
     }
 }
 void handleClient(SOCKET clientSocket){
-    //0. snapshot of exact start time
-    auto start_time = std::chrono::high_resolution_clock::now();
-
     // Enable TCP_NODELAY
     int flag = 1;
     setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
+    setsockopt(clientSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&flag, sizeof(int));
 
-    // client timeout
-    DWORD clientTimeout = 2000 ; // 2s
-    setsockopt(clientSocket,SOL_SOCKET, SO_RCVTIMEO, (const char*)&clientTimeout, sizeof(clientTimeout));
-    //1. to recv from caller / recv the browser request
-    char buffer[4096]= {0}; // to store incoming msg
-    int bytesReceived = recv(clientSocket,buffer, sizeof(buffer),0);
+    linger sl = {1, 0}; // Instant 0-second teardown — zero TIME_WAIT buildup across runs
+    setsockopt(clientSocket, SOL_SOCKET, SO_LINGER, (const char*)&sl, sizeof(sl));
 
-     if(bytesReceived<=0){
-        closesocket(clientSocket);
-        return;
-     }
-    
-        // std::cout<<"--raw data recved--\n";
-        // std::cout<<buffer<<'\n';
-        // std::cout<<"---------------\n";
+    DWORD clientTimeout = 5000; // 5s idle keep-alive timeout
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&clientTimeout, sizeof(clientTimeout));
 
-        // parsing
-        HTTPRequest req;
-        req.parse(buffer);
-        // std::cout<<" "<<req.method<<" "<<req.path<<"\n";
-
-    // 2. connect to the backend (load balancer and Fault tolerant)
-    SOCKET backendSocket = INVALID_SOCKET;
-    bool connected = false;
     int targetPort = 0;
 
     // Safely get the next port from the HEALTHY list
@@ -152,9 +133,11 @@ void handleClient(SOCKET clientSocket){
     } // Mutex releases here!
 
     // We know it's healthy, so we only need to connect ONCE!
-    backendSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET backendSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     setsockopt(backendSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
-    
+    setsockopt(backendSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&flag, sizeof(int));
+    setsockopt(backendSocket, SOL_SOCKET, SO_LINGER, (const char*)&sl, sizeof(sl));
+
     // --- 2. Backend Timeout ---
     DWORD backendTimeout = 2000;
     setsockopt(backendSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&backendTimeout, sizeof(backendTimeout));
@@ -164,9 +147,7 @@ void handleClient(SOCKET clientSocket){
     backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
     backendAddr.sin_port = htons(targetPort);
 
-    if (connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr)) != SOCKET_ERROR) {
-        connected = true;
-    } else {
+    if (connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr)) == SOCKET_ERROR) {
         std::cerr << "[Proxy] Unexpected failure connecting to " << targetPort << " (Did it crash just now?)\n";
 
         // Send a real HTTP error to the browser
@@ -178,31 +159,51 @@ void handleClient(SOCKET clientSocket){
         return;
     }
 
-    //3. forward the browser's req to the backend
-    //AND  Modify the request: tell backend to close connection after responding
+    while (true) {
+        //0. snapshot of exact start time
+        // auto start_time = std::chrono::high_resolution_clock::now();
 
+        //1. to recv from caller / recv the browser request
+        char buffer[4096] = {0}; // to store incoming msg
+        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+        if (bytesReceived <= 0) break;
 
-    std::string request(buffer, bytesReceived);
-    size_t pos = request.find("Connection: keep-alive");
-    if (pos != std::string::npos) {
-        request.replace(pos, 22, "Connection: close");
-    }
-    send(backendSocket, request.c_str(), request.size(), 0);
-    // std::cout << "[Proxy]: forwarded request to backend\n";
+        // std::cout<<"--raw data recved--\n";
+        // std::cout<<buffer<<'\n';
+        // std::cout<<"---------------\n";
 
-    // 4. recv the backend's response AND
-    // 5. forward the backend's response to the browser
-    char backendBuffer[8192] = {0};
+        // parsing
+        HTTPRequest req;
+        req.parse(buffer);
+        // std::cout<<" "<<req.method<<" "<<req.path<<"\n";
 
-    // Keep reading chunks from backend until it's done sending
-    int totalBytes =0;
-    int backendBytes;
-    while ((backendBytes = recv(backendSocket, backendBuffer, sizeof(backendBuffer), 0)) > 0) {
-        send(clientSocket, backendBuffer, backendBytes, 0);
+        //3. forward the browser's req to the backend
+        if (send(backendSocket, buffer, bytesReceived, 0) == SOCKET_ERROR) break;
+        // std::cout << "[Proxy]: forwarded request to backend\n";
+
+        // 4. recv the backend's response AND
+        // 5. forward the backend's response to the browser
+        char backendBuffer[8192] = {0};
+        int backendBytes = recv(backendSocket, backendBuffer, sizeof(backendBuffer), 0);
+        if (backendBytes <= 0) break;
+
+        if (send(clientSocket, backendBuffer, backendBytes, 0) == SOCKET_ERROR) break;
         // std::cout << "[Proxy] Relayed " << backendBytes << " bytes\n";
-        totalBytes+=backendBytes;
+
+        // auto end_time = std::chrono::high_resolution_clock::now();
+        // calculate difference in time
+        // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        // std::cout << "[ACCESS] " << req.method << " " << req.path 
+        //           << " -> Backend :" << targetPort 
+        //           << " | Relayed " << backendBytes << " bytes"
+        //           << " | Latency: " << duration << "ms\n";
+
+        std::string requestStr(buffer, bytesReceived);
+        if (requestStr.find("Connection: close") != std::string::npos ||
+            requestStr.find("connection: close") != std::string::npos) {
+            break;
+        }
     }
-    // std::cout << "[Proxy] Backend finished sending.\n";
 
     shutdown(backendSocket,SD_SEND);
     char dummy1[256];
@@ -213,16 +214,6 @@ void handleClient(SOCKET clientSocket){
     char dummy2[256];
     while (recv(clientSocket, dummy2, sizeof(dummy2), 0) > 0) {}
     closesocket(clientSocket);
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-
-    //calculate difference in time
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time-start_time).count();
-    // Uncomment for production logging (disabled during benchmark — cout is slow on Windows)
-    // std::cout << "[ACCESS] " << req.method << " " << req.path 
-    //           << " -> Backend :" << targetPort 
-    //           << " | Relayed " << totalBytes << " bytes"
-    //           << " | Latency: "<<duration<<"ms\n";
 
     // std::cout<<"[Proxy] connection closed\n\n";
 }
