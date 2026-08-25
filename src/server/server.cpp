@@ -4,6 +4,7 @@
 #include<winsock2.h>
 #include<ws2tcpip.h>
 #include "../http/request.h"
+#include<string>
 
 TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port),pool(8){
      WSADATA wsaData;
@@ -55,11 +56,15 @@ bool TCPServer::start(){
     return true;
 }
 void handleClient(SOCKET clientSocket){
-    // to recv from caller
-    char buffer[1024]= {0}; // to store incoming msg
+    //1. to recv from caller / recv the browser request
+    char buffer[4096]= {0}; // to store incoming msg
     int bytesReceived = recv(clientSocket,buffer, sizeof(buffer),0);
 
-    if(bytesReceived>0){
+     if(bytesReceived<=0){
+        closesocket(clientSocket);
+        return;
+     }
+    
         std::cout<<"--raw data recved--\n";
         std::cout<<buffer<<'\n';
         std::cout<<"---------------\n";
@@ -67,14 +72,59 @@ void handleClient(SOCKET clientSocket){
         // parsing
         HTTPRequest req;
         req.parse(buffer);
+        std::cout<<" "<<req.method<<" "<<req.path<<"\n";
+
+    // 2.connect to the backend (so its acting as client)
+
+    SOCKET backendSocket = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    if(backendSocket==INVALID_SOCKET){
+        std::cerr<<"[proxy] failed to create backend socket\n";
+        closesocket(clientSocket);
+        return;
     }
-    const char* response = "HTTP/1.1 200 OK\r\n" "Content-Type: text/html\r\n" "Content-Length: 46\r\n"   "Connection: close\r\n" "\r\n" "<html><body><h1>Hello World!</h1></body></html>";
-    send(clientSocket,response,strlen(response),0);
-    shutdown(clientSocket, SD_SEND);
+
+    sockaddr_in backendAddr;
+    backendAddr.sin_family = AF_INET;
+    backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    backendAddr.sin_port = htons(9001); // Python server
+
+     if (connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr)) == SOCKET_ERROR) {
+        std::cerr << "[Proxy] Failed to connect to backend on port 9001\n";
+        closesocket(backendSocket);
+        closesocket(clientSocket);
+        return;
+    }
+
+    std::cout<<"[Proxy] : connected to backend : 9001\n";
+
+    //3. forward the browser's req to the backend
+    //AND  Modify the request: tell backend to close connection after responding
+
+
+    std::string request(buffer, bytesReceived);
+    size_t pos = request.find("Connection: keep-alive");
+    if (pos != std::string::npos) {
+        request.replace(pos, 22, "Connection: close");
+    }
+    send(backendSocket, request.c_str(), request.size(), 0);
+    std::cout << "[Proxy]: forwarded request to backend\n";
+
+    // 4. recv the backend's response AND
+    // 5. forward the backend's response to the browser
+    char backendBuffer[8192] = {0};
+    // Keep reading chunks from backend until it's done sending
+    int backendBytes;
+    while ((backendBytes = recv(backendSocket, backendBuffer, sizeof(backendBuffer), 0)) > 0) {
+        send(clientSocket, backendBuffer, backendBytes, 0);
+        std::cout << "[Proxy] Relayed " << backendBytes << " bytes\n";
+    }
+    std::cout << "[Proxy] Backend finished sending.\n";
+
+    shutdown(backendSocket,SD_SEND);
+    closesocket(backendSocket);
+    shutdown(clientSocket,SD_SEND);
     closesocket(clientSocket);
-
-    std:: cout<<"Client handled and disconnected.\n";
-
+    std::cout<<"[Proxy] connection closed\n\n";
 }
 
 
