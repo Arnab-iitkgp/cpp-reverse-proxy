@@ -15,6 +15,8 @@ BOOL WINAPI consoleHandler(DWORD signal){
     }
     return false;
 }
+void backgroundHealthMonitor();
+
 int main(){
     //register ctrl_c handler with wondows
 
@@ -28,6 +30,8 @@ int main(){
 
 
     if(server.start()){
+        std::thread monitor(backgroundHealthMonitor);
+        monitor.detach();// let it run indep in the background
        while(server.isRunning()) server.listenForCLient();
     }else{
         std::cerr<<"Failed to start the server. \n";

@@ -7,6 +7,7 @@
 #include<string>
 #include<vector>
 #include<mutex>
+#include<chrono>
 
 TCPServer::TCPServer(std::string ip_address, int port):ip_address(ip_address), port(port),pool(8){
      WSADATA wsaData;
@@ -58,12 +59,51 @@ bool TCPServer::start(){
     return true;
 }
 
-std::vector<int>backends = {9001,9002,9003}; // list of backend server
+// global routing state
+std::vector<int>all_backends = {9001,9002,9003}; // list of backend server
+std::vector<int> healthy_backends = {9001,9002,9003}; // workers only use this
+
 int current_backend_index=0;
 std::mutex rr_mutex; // protects the current_backend_index
 
+//runs in background and pings server every 5 sec
+void backgroundHealthMonitor(){
+    while(true){
+        std::vector<int>newly_healthy;
 
+        for(int port: all_backends){
+            SOCKET testSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in addr;
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            addr.sin_port = htons(port);
+
+            // Ping the server to see if it's alive
+            if (connect(testSocket, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                newly_healthy.push_back(port);
+            }
+            closesocket(testSocket);
+        }
+            // safeky update the global list of healthy backends
+        {
+            std::unique_lock<std::mutex> lock(rr_mutex);
+            healthy_backends = newly_healthy;
+        }
+        // sleep for 5 sec before checing again
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+}
 void handleClient(SOCKET clientSocket){
+    //0. snapshot of exact start time
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Enable TCP_NODELAY
+    int flag = 1;
+    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
+
+    // client timeout
+    DWORD clientTimeout = 2000 ; // 2s
+    setsockopt(clientSocket,SOL_SOCKET, SO_RCVTIMEO, (const char*)&clientTimeout, sizeof(clientTimeout));
     //1. to recv from caller / recv the browser request
     char buffer[4096]= {0}; // to store incoming msg
     int bytesReceived = recv(clientSocket,buffer, sizeof(buffer),0);
@@ -84,39 +124,56 @@ void handleClient(SOCKET clientSocket){
 
     // 2. connect to the backend (load balancer and Fault tolerant)
     SOCKET backendSocket = INVALID_SOCKET;
-    int retries = backends.size() ; // try each backend exactly once
     bool connected = false;
     int targetPort = 0;
 
-    while(retries>0 && !connected){
-        // safely get the next prot using Round-Robin mutex
-        {
-            std::unique_lock<std::mutex>lock(rr_mutex);
-            targetPort = backends[current_backend_index];
-            current_backend_index = (current_backend_index+1)%backends.size();
-            //mutex release here
+    // Safely get the next port from the HEALTHY list
+    {
+        std::unique_lock<std::mutex> lock(rr_mutex);
+        if (healthy_backends.empty()) {
+            std::cerr << "[Proxy] ALL BACKENDS ARE DOWN! Sending 502 Bad Gateway.\n";
+            
+            // Send a real HTTP error to the browser
+            const char* error502 = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n<h1>502 Bad Gateway</h1><p>All backend servers are currently down.</p>";
+            send(clientSocket, error502, strlen(error502), 0);
+            
+            closesocket(clientSocket);
+            return;
         }
-        backendSocket = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
 
-        sockaddr_in backendAddr;
-        backendAddr.sin_family = AF_INET;
-        backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        backendAddr.sin_port = htons(targetPort);
 
-        // std::cout<<"[Proxy] Attempting to connect backend : "<<targetPort<<"...\n";
-
-        if(connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr))!=SOCKET_ERROR){
-            connected=true;
-            // std::cout<<"[Proxy] suuccessfully connected to backend "<<targetPort<<"\n";
-        }else{
-            std::cerr<<"[Proxy] Backend: "<<targetPort<<" is down! Trying the next";
-            closesocket(backendSocket);
-            retries--;
+        // Wrap around if index went out of bounds (e.g. if a server died)
+        if (current_backend_index >= healthy_backends.size()) {
+            current_backend_index = 0;
         }
-    }
 
-    if(!connected){
-        std::cerr<<"[Proxy] All backends are DOWN! Dropping client.\n";
+        targetPort = healthy_backends[current_backend_index];
+        current_backend_index = (current_backend_index + 1) % healthy_backends.size();
+    } // Mutex releases here!
+
+    // We know it's healthy, so we only need to connect ONCE!
+    backendSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    setsockopt(backendSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
+    
+    // --- 2. Backend Timeout ---
+    DWORD backendTimeout = 2000;
+    setsockopt(backendSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&backendTimeout, sizeof(backendTimeout));
+
+    sockaddr_in backendAddr;
+    backendAddr.sin_family = AF_INET;
+    backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    backendAddr.sin_port = htons(targetPort);
+
+    if (connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr)) != SOCKET_ERROR) {
+        connected = true;
+    } else {
+        std::cerr << "[Proxy] Unexpected failure connecting to " << targetPort << " (Did it crash just now?)\n";
+
+        // Send a real HTTP error to the browser
+        const char* error502 = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n<h1>502 Bad Gateway</h1><p>Backend server unexpectedly failed.</p>";
+        send(clientSocket, error502, strlen(error502), 0);
+        
+        closesocket(backendSocket);
         closesocket(clientSocket);
         return;
     }
@@ -148,21 +205,32 @@ void handleClient(SOCKET clientSocket){
     // std::cout << "[Proxy] Backend finished sending.\n";
 
     shutdown(backendSocket,SD_SEND);
+    char dummy1[256];
+    while (recv(backendSocket, dummy1, sizeof(dummy1), 0) > 0) {}
     closesocket(backendSocket);
+
     shutdown(clientSocket,SD_SEND);
+    char dummy2[256];
+    while (recv(clientSocket, dummy2, sizeof(dummy2), 0) > 0) {}
     closesocket(clientSocket);
 
-    std::cout << "[ACCESS] " << req.method << " " << req.path 
-              << " -> Backend :" << targetPort 
-              << " | Relayed " << totalBytes << " bytes\n";
+    auto end_time = std::chrono::high_resolution_clock::now();
 
-    std::cout<<"[Proxy] connection closed\n\n";
+    //calculate difference in time
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time-start_time).count();
+    // Uncomment for production logging (disabled during benchmark — cout is slow on Windows)
+    // std::cout << "[ACCESS] " << req.method << " " << req.path 
+    //           << " -> Backend :" << targetPort 
+    //           << " | Relayed " << totalBytes << " bytes"
+    //           << " | Latency: "<<duration<<"ms\n";
+
+    // std::cout<<"[Proxy] connection closed\n\n";
 }
 
 
 void TCPServer::listenForCLient(){
    //accepting client
-    std::cout<<"Waiting for a client to connect...\n";
+    // std::cout<<"Waiting for a client to connect...\n";
     SOCKET clientSocket = accept(serverSocket,NULL,NULL);
 
     if(clientSocket == INVALID_SOCKET){
@@ -177,7 +245,7 @@ void TCPServer::listenForCLient(){
         return;
     }
 
-    std::cout<<"A client is connected\n";
+    // std::cout<<"A client is connected\n";
 
     // push the task into ouor thread pool queue
     // the [clientSocket] means "pass this var into the lambda"
