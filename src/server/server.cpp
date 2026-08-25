@@ -73,14 +73,14 @@ void handleClient(SOCKET clientSocket){
         return;
      }
     
-        std::cout<<"--raw data recved--\n";
-        std::cout<<buffer<<'\n';
-        std::cout<<"---------------\n";
+        // std::cout<<"--raw data recved--\n";
+        // std::cout<<buffer<<'\n';
+        // std::cout<<"---------------\n";
 
         // parsing
         HTTPRequest req;
         req.parse(buffer);
-        std::cout<<" "<<req.method<<" "<<req.path<<"\n";
+        // std::cout<<" "<<req.method<<" "<<req.path<<"\n";
 
     // 2. connect to the backend (load balancer and Fault tolerant)
     SOCKET backendSocket = INVALID_SOCKET;
@@ -103,11 +103,11 @@ void handleClient(SOCKET clientSocket){
         backendAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
         backendAddr.sin_port = htons(targetPort);
 
-        std::cout<<"[Proxy] Attempting to connect backend : "<<targetPort<<"...\n";
+        // std::cout<<"[Proxy] Attempting to connect backend : "<<targetPort<<"...\n";
 
         if(connect(backendSocket, (sockaddr*)&backendAddr, sizeof(backendAddr))!=SOCKET_ERROR){
             connected=true;
-            std::cout<<"[Proxy] suuccessfully connected to backend "<<targetPort<<"\n";
+            // std::cout<<"[Proxy] suuccessfully connected to backend "<<targetPort<<"\n";
         }else{
             std::cerr<<"[Proxy] Backend: "<<targetPort<<" is down! Trying the next";
             closesocket(backendSocket);
@@ -131,23 +131,31 @@ void handleClient(SOCKET clientSocket){
         request.replace(pos, 22, "Connection: close");
     }
     send(backendSocket, request.c_str(), request.size(), 0);
-    std::cout << "[Proxy]: forwarded request to backend\n";
+    // std::cout << "[Proxy]: forwarded request to backend\n";
 
     // 4. recv the backend's response AND
     // 5. forward the backend's response to the browser
     char backendBuffer[8192] = {0};
+
     // Keep reading chunks from backend until it's done sending
+    int totalBytes =0;
     int backendBytes;
     while ((backendBytes = recv(backendSocket, backendBuffer, sizeof(backendBuffer), 0)) > 0) {
         send(clientSocket, backendBuffer, backendBytes, 0);
-        std::cout << "[Proxy] Relayed " << backendBytes << " bytes\n";
+        // std::cout << "[Proxy] Relayed " << backendBytes << " bytes\n";
+        totalBytes+=backendBytes;
     }
-    std::cout << "[Proxy] Backend finished sending.\n";
+    // std::cout << "[Proxy] Backend finished sending.\n";
 
     shutdown(backendSocket,SD_SEND);
     closesocket(backendSocket);
     shutdown(clientSocket,SD_SEND);
     closesocket(clientSocket);
+
+    std::cout << "[ACCESS] " << req.method << " " << req.path 
+              << " -> Backend :" << targetPort 
+              << " | Relayed " << totalBytes << " bytes\n";
+
     std::cout<<"[Proxy] connection closed\n\n";
 }
 
