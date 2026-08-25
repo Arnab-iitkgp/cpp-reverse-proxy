@@ -158,6 +158,11 @@ void TCPServer::listenForCLient(){
     SOCKET clientSocket = accept(serverSocket,NULL,NULL);
 
     if(clientSocket == INVALID_SOCKET){
+        if(!running){
+            //the stop fn closes the socket
+            std::cout << "[System] accept() unblocked for clean shutdown.\n";
+            return;
+        }
         std::cerr<<"Accept failed\n";
         closesocket(serverSocket);
         WSACleanup();
@@ -172,4 +177,20 @@ void TCPServer::listenForCLient(){
     pool.enqueue([clientSocket]{
         handleClient(clientSocket);
     });
+}
+
+bool TCPServer::isRunning(){
+    return running;
+}
+
+bool TCPServer::stop(){
+    if(running){
+        running=false;
+        //accept() is a blocking fn, it pauses program forever until
+        // a client connects.
+        //By forcibly closing the socket from another thread (the signal handler),
+        // accept() will instantly wake up and return INVALID_SOCKET!
+        closesocket(serverSocket);
+    }
+    return true;
 }

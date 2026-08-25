@@ -9,9 +9,12 @@ class TCPServer {
     int port;
     SOCKET serverSocket;
     ThreadPool pool;
+    bool running = true;
     public:
     TCPServer(std::string ip_address, int port);
     ~TCPServer();
     bool start();
     void listenForCLient();
+    bool stop();
+    bool isRunning();
 };
